@@ -23,11 +23,19 @@ if (operation.MaxConcurrentDownloads is < 1 or > 64)
     throw new ArgumentOutOfRangeException(nameof(operation.MaxConcurrentDownloads), "Use 1 through 64.");
 if (mode == OperationMode.Download && string.IsNullOrWhiteSpace(operation.DownloadDirectory))
     throw new ArgumentException("DownloadDirectory is required in Download mode.");
-var start = DateOnly.ParseExact(settings.StartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-var end = DateOnly.ParseExact(settings.EndDate, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-if (end < start || end == DateOnly.MaxValue) throw new ArgumentException("Invalid date range.");
-var fromUtc = new DateTimeOffset(start.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
-var toUtcExclusive = new DateTimeOffset(end.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+DateTimeOffset? fromUtc = null;
+DateTimeOffset? toUtcExclusive = null;
+if (settings.EnableDateFilter)
+{
+    if (!DateOnly.TryParseExact(settings.StartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out var start) ||
+        !DateOnly.TryParseExact(settings.EndDate, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out var end) || end < start || end == DateOnly.MaxValue)
+        throw new ArgumentException("When EnableDateFilter=true, provide a valid StartDate and EndDate (yyyy-MM-dd).");
+
+    fromUtc = new DateTimeOffset(start.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+    toUtcExclusive = new DateTimeOffset(end.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+}
 var basePath = (settings.DirectoryPath ?? "").Replace('\\', '/').Trim('/');
 var segments = basePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
 if (segments.Any(s => s is "." or ".." || s.Contains(':')))
@@ -86,7 +94,9 @@ var queue = Channel.CreateBounded<DownloadJob>(new BoundedChannelOptions(Math.Ma
 try
 {
     Print($"Mode: {mode} | Share: {settings.ShareName} | Directory: {(basePath.Length == 0 ? "(root)" : basePath)}");
-    Print($"Modified UTC: {start:yyyy-MM-dd} through {end:yyyy-MM-dd} | Recursive: {settings.Recursive}");
+    Print(settings.EnableDateFilter
+        ? $"Modified UTC: {fromUtc:yyyy-MM-dd} through {toUtcExclusive!.Value.AddDays(-1):yyyy-MM-dd} | Recursive: {settings.Recursive}"
+        : $"Modified UTC: ALL DATES (filter disabled) | Recursive: {settings.Recursive}");
     if (mode == OperationMode.Download)
         Print($"Download root: {downloadRoot} | Parallel workers: {operation.MaxConcurrentDownloads}");
 
@@ -129,7 +139,9 @@ async Task ScanAsync(Azure.Storage.Files.Shares.ShareDirectoryClient current, st
             {
                 var file = current.GetFileClient(item.Name);
                 var properties = (await file.GetPropertiesAsync()).Value;
-                if (properties.LastModified < fromUtc || properties.LastModified >= toUtcExclusive) continue;
+                if (settings.EnableDateFilter &&
+                    (properties.LastModified < fromUtc!.Value || properties.LastModified >= toUtcExclusive!.Value))
+                    continue;
                 Interlocked.Increment(ref matched);
                 Print($"{properties.LastModified:yyyy-MM-dd HH:mm:ss} UTC | {properties.ContentLength,12:N0} bytes | {childPath}");
                 if (mode == OperationMode.Download)
@@ -217,6 +229,7 @@ sealed class FileShareSettings
     public string ConnectionString { get; set; } = "";
     public string ShareName { get; set; } = "";
     public string DirectoryPath { get; set; } = "";
+    public bool EnableDateFilter { get; set; } = false;
     public string StartDate { get; set; } = "";
     public string EndDate { get; set; } = "";
     public bool Recursive { get; set; } = true;
