@@ -36,10 +36,21 @@ if (settings.EnableDateFilter)
     fromUtc = new DateTimeOffset(start.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
     toUtcExclusive = new DateTimeOffset(end.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
 }
-var basePath = (settings.DirectoryPath ?? "").Replace('\\', '/').Trim('/');
-var segments = basePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-if (segments.Any(s => s is "." or ".." || s.Contains(':')))
-    throw new ArgumentException("Invalid Azure directory path.");
+// DirectoryPaths takes precedence. Legacy DirectoryPath remains supported.
+var configuredPaths = settings.DirectoryPaths is { Count: > 0 }
+    ? settings.DirectoryPaths
+    : new List<string> { settings.DirectoryPath };
+var requestedPaths = configuredPaths.Select(NormalizeAzurePath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+// Remove nested paths when an ancestor is already scanned recursively.
+var scanPaths = new List<string>();
+foreach (var path in requestedPaths.OrderBy(p => p.Length))
+{
+    if (scanPaths.Any(parent => parent.Length == 0 ||
+        (settings.Recursive && path.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase))))
+        continue;
+    scanPaths.Add(path);
+}
+// With non-recursive scanning, different configured paths are independent.
 var downloadRoot = mode == OperationMode.Download ? Path.GetFullPath(operation.DownloadDirectory) : "";
 var clientOptions = new ShareClientOptions();
 clientOptions.Retry.Mode = RetryMode.Exponential;
@@ -47,8 +58,6 @@ clientOptions.Retry.MaxRetries = 5;
 clientOptions.Retry.Delay = TimeSpan.FromSeconds(1);
 clientOptions.Retry.MaxDelay = TimeSpan.FromSeconds(15);
 var share = new ShareClient(connection, settings.ShareName, clientOptions);
-var directory = share.GetRootDirectoryClient();
-foreach (var segment in segments) directory = directory.GetSubdirectoryClient(segment);
 
 StreamWriter? writer = null;
 string? reportPath = null;
@@ -93,7 +102,7 @@ var queue = Channel.CreateBounded<DownloadJob>(new BoundedChannelOptions(Math.Ma
 
 try
 {
-    Print($"Mode: {mode} | Share: {settings.ShareName} | Directory: {(basePath.Length == 0 ? "(root)" : basePath)}");
+    Print($"Mode: {mode} | Share: {settings.ShareName} | Directories: {string.Join(", ", scanPaths.Select(p => p.Length == 0 ? "(root)" : p))}");
     Print(settings.EnableDateFilter
         ? $"Modified UTC: {fromUtc:yyyy-MM-dd} through {toUtcExclusive!.Value.AddDays(-1):yyyy-MM-dd} | Recursive: {settings.Recursive}"
         : $"Modified UTC: ALL DATES (filter disabled) | Recursive: {settings.Recursive}");
@@ -106,7 +115,13 @@ try
         : Array.Empty<Task>();
     try
     {
-        await ScanAsync(directory, basePath);
+        foreach (var path in scanPaths)
+        {
+            var directory = share.GetRootDirectoryClient();
+            foreach (var segment in path.Split('/', StringSplitOptions.RemoveEmptyEntries))
+                directory = directory.GetSubdirectoryClient(segment);
+            await ScanAsync(directory, path);
+        }
     }
     finally
     {
@@ -176,7 +191,8 @@ async Task DownloadWorkerAsync()
 
 async Task DownloadOneAsync(DownloadJob job)
 {
-    var relative = basePath.Length == 0 ? job.Path : job.Path[(basePath.Length + 1)..];
+    // Keep the full share-relative path to avoid collisions between selected directories.
+    var relative = job.Path;
     var parts = relative.Split('/');
     if (parts.Any(p => p.Length == 0 || p is "." or ".." || p.Contains('\\') || p.Contains(':') || p.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0))
         throw new ArgumentException("Unsafe filename or path.");
@@ -223,12 +239,23 @@ async Task DownloadOneAsync(DownloadJob job)
     }
 }
 
+static string NormalizeAzurePath(string? value)
+{
+    var normalized = (value ?? "").Replace('\\', '/').Trim('/');
+    var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (segments.Any(segment => segment is "." or ".." ||
+        segment.Contains(':') || segment.Any(char.IsControl)))
+        throw new ArgumentException($"Invalid Azure directory path: {value}");
+    return string.Join('/', segments);
+}
+
 record DownloadJob(Azure.Storage.Files.Shares.ShareFileClient Client, string Path);
 sealed class FileShareSettings
 {
     public string ConnectionString { get; set; } = "";
     public string ShareName { get; set; } = "";
     public string DirectoryPath { get; set; } = "";
+    public List<string> DirectoryPaths { get; set; } = new();
     public bool EnableDateFilter { get; set; } = false;
     public string StartDate { get; set; } = "";
     public string EndDate { get; set; } = "";
